@@ -17,7 +17,17 @@ HTTP pipeline by reusing the TLS parsing logic from
 Build Caddy with this module enabled, for example with `xcaddy`:
 
 ```bash
-xcaddy build --with github.com/mattaustin/caddy-ja4s=.
+# From the caddy-ja4s directory
+xcaddy build --with github.com/matt-/caddy-ja4s=.
+
+# Or with an absolute path
+xcaddy build --with github.com/matt-/caddy-ja4s=/Users/mattaustin/hax/caddy/caddy-ja4s
+```
+
+**If building Caddy from source**, add this to Caddy's `go.mod`:
+
+```go
+replace github.com/matt-/caddy-ja4s => /Users/mattaustin/hax/caddy/caddy-ja4s
 ```
 
 ### Basic Configuration
