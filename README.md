@@ -34,7 +34,9 @@ replace github.com/matt-/caddy-ja4s => /Users/mattaustin/hax/caddy/caddy-ja4s
 
 The listener wrapper must run **before** the TLS placeholder wrapper so that it
 can observe the plaintext TLS handshake. Make sure your `listener_wrappers`
-list keeps the `ja4s` wrapper in front of `tls`:
+list keeps the `ja4s` wrapper in front of `tls`.
+
+#### JSON Configuration
 
 ```jsonc
 {
@@ -66,6 +68,72 @@ list keeps the `ja4s` wrapper in front of `tls`:
 }
 ```
 
+#### Caddyfile Configuration
+
+Configure the listener wrapper in the global options block, and use the handler in your site blocks:
+
+```caddyfile
+{
+    servers {
+        listener_wrappers {
+            ja4s
+            tls
+        }
+    }
+}
+
+example.com {
+    # Use the ja4s handler
+    ja4s {
+        request_header X-JA4S
+        response_header X-JA4S
+        var_name ja4s
+        # require  # Uncomment to reject requests without fingerprint
+    }
+
+    # Log the fingerprint
+    log {
+        format console
+    }
+
+    # Use the fingerprint in a response
+    respond "JA4S: {http.vars.ja4s}"
+}
+```
+
+**Important:** The `ja4s` listener wrapper must appear **before** the `tls` wrapper in the `listener_wrappers` block so it can observe the plaintext TLS handshake.
+
+You can also configure additional listener wrapper options if needed:
+
+```caddyfile
+{
+    servers {
+        listener_wrappers {
+            ja4s {
+                max_capture_bytes 16384
+                protocol tls
+            }
+            tls
+        }
+    }
+}
+```
+
+**Handler in Caddyfile:**
+
+The `ja4s` handler supports these options in Caddyfile:
+
+```caddyfile
+ja4s {
+    request_header <header-name>    # Header to set on request (optional)
+    response_header <header-name>   # Header to set on response (optional)
+    var_name <name>                 # Variable name (default: "ja4s")
+    require                         # Reject requests without fingerprint (optional)
+}
+```
+
+#### Handler Options
+
 With the handler in place:
 
 - The request upstream header `X-JA4S` will contain the fingerprint.
@@ -73,7 +141,7 @@ With the handler in place:
 - The value is also available as the `{http.vars.ja4s}` placeholder for logs,
   matchers, templates, etc.
 
-Set `require: true` on the handler if you prefer to reject requests where a
+Set `require` in the handler block if you prefer to reject requests where a
 fingerprint could not be extracted (for example, when a connection is not
 handled by TLS or the negotiation failed too early).
 

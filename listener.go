@@ -5,10 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 
 	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/voukatas/go-ja4/pkg/ja4"
 	"go.uber.org/zap"
 )
@@ -67,6 +69,38 @@ func (lw *ListenerWrapper) Validate() error {
 	if lw.MaxCaptureBytes < minRecordSize {
 		return fmt.Errorf("max_capture_bytes must be at least %d", minRecordSize)
 	}
+	return nil
+}
+
+// UnmarshalCaddyfile implements caddyfile.Unmarshaler.
+func (lw *ListenerWrapper) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
+	// Consume the directive name (e.g., "ja4s")
+	d.Next()
+
+	// Check if there's a block with options
+	for d.NextBlock(0) {
+		switch d.Val() {
+		case "max_capture_bytes":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			val, err := strconv.Atoi(d.Val())
+			if err != nil {
+				return d.Errf("invalid max_capture_bytes value: %v", err)
+			}
+			lw.MaxCaptureBytes = val
+
+		case "protocol":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			lw.Protocol = d.Val()
+
+		default:
+			return d.Errf("unknown option: %s", d.Val())
+		}
+	}
+
 	return nil
 }
 
@@ -254,3 +288,10 @@ func (sht *serverHelloTracker) Result() (string, error) {
 
 	return sht.fingerprint, nil
 }
+
+// Interface guards.
+var (
+	_ caddyfile.Unmarshaler = (*ListenerWrapper)(nil)
+	_ caddy.Provisioner     = (*ListenerWrapper)(nil)
+	_ caddy.Validator       = (*ListenerWrapper)(nil)
+)
