@@ -11,6 +11,8 @@ import (
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
+	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/voukatas/go-ja4/pkg/ja4"
 	"go.uber.org/zap"
 )
@@ -18,6 +20,7 @@ import (
 func init() {
 	caddy.RegisterModule(ListenerWrapper{})
 	caddy.RegisterModule(Handler{})
+	httpcaddyfile.RegisterHandlerDirective("ja4s", parseCaddyfileHandler)
 }
 
 // ListenerWrapper captures outbound TLS handshake data so the server hello
@@ -287,6 +290,13 @@ func (sht *serverHelloTracker) Result() (string, error) {
 	}
 
 	return sht.fingerprint, nil
+}
+
+// parseCaddyfileHandler parses the ja4s handler directive.
+func parseCaddyfileHandler(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
+	var handler Handler
+	err := handler.UnmarshalCaddyfile(h.Dispenser)
+	return &handler, err
 }
 
 // Interface guards.

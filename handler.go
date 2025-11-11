@@ -7,6 +7,7 @@ import (
 	"net/http"
 
 	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
 
@@ -40,6 +41,43 @@ func (h *Handler) Provision(caddy.Context) error {
 	if h.VarName == "" {
 		h.VarName = "ja4s"
 	}
+	return nil
+}
+
+// UnmarshalCaddyfile implements caddyfile.Unmarshaler.
+func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
+	// Consume the directive name (e.g., "ja4s")
+	d.Next()
+
+	// Parse options in the block
+	for d.NextBlock(0) {
+		switch d.Val() {
+		case "request_header":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			h.RequestHeader = d.Val()
+
+		case "response_header":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			h.ResponseHeader = d.Val()
+
+		case "var_name":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			h.VarName = d.Val()
+
+		case "require":
+			h.Require = true
+
+		default:
+			return d.Errf("unknown option: %s", d.Val())
+		}
+	}
+
 	return nil
 }
 
@@ -99,6 +137,7 @@ func connectionFromRequest(r *http.Request) (net.Conn, error) {
 
 // Interface guards.
 var (
+	_ caddyfile.Unmarshaler       = (*Handler)(nil)
 	_ caddyhttp.MiddlewareHandler = (*Handler)(nil)
 	_ caddy.Provisioner           = (*Handler)(nil)
 )
