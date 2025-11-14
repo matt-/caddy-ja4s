@@ -20,18 +20,18 @@ import (
 func init() {
 	caddy.RegisterModule(ListenerWrapper{})
 	caddy.RegisterModule(Handler{})
-	httpcaddyfile.RegisterHandlerDirective("ja4s", parseCaddyfileHandler)
+	httpcaddyfile.RegisterHandlerDirective("ja4", parseCaddyfileHandler)
 }
 
-// ListenerWrapper captures outbound TLS handshake data so the server hello
-// can be converted into a JA4S fingerprint.
+// ListenerWrapper captures inbound TLS handshake data so the client hello
+// can be converted into a JA4 fingerprint.
 //
 // To observe the unencrypted TLS records this wrapper must appear before the
 // TLS placeholder wrapper (`caddy.listeners.tls`) in the listener_wrappers
 // chain.
 type ListenerWrapper struct {
-	// Maximum number of bytes to keep while waiting for the ServerHello record.
-	// JA4S only needs the first TLS record, so small buffers are sufficient.
+	// Maximum number of bytes to keep while waiting for the ClientHello record.
+	// JA4 only needs the first TLS record, so small buffers are sufficient.
 	MaxCaptureBytes int `json:"max_capture_bytes,omitempty"`
 
 	// Protocol hint that is forwarded to the go-ja4 parser. Defaults to "tls".
@@ -44,7 +44,7 @@ type ListenerWrapper struct {
 // CaddyModule implements caddy.Module.
 func (ListenerWrapper) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
-		ID:  "caddy.listeners.ja4s",
+		ID:  "caddy.listeners.ja4",
 		New: func() caddy.Module { return new(ListenerWrapper) },
 	}
 }
@@ -77,7 +77,7 @@ func (lw *ListenerWrapper) Validate() error {
 
 // UnmarshalCaddyfile implements caddyfile.Unmarshaler.
 func (lw *ListenerWrapper) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
-	// Consume the directive name (e.g., "ja4s")
+	// Consume the directive name (e.g., "ja4")
 	d.Next()
 
 	// Check if there's a block with options
@@ -107,7 +107,7 @@ func (lw *ListenerWrapper) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	return nil
 }
 
-// WrapListener wraps the provided listener with the JA4S capturing logic.
+// WrapListener wraps the provided listener with the JA4 capturing logic.
 func (lw *ListenerWrapper) WrapListener(ln net.Listener) net.Listener {
 	return &trackingListener{
 		Listener: ln,
@@ -130,7 +130,7 @@ func (tl *trackingListener) Accept() (net.Conn, error) {
 		return nil, err
 	}
 	tracked := newTrackedConn(conn, tl.cfg)
-	tl.cfg.logger.Info("wrapped connection with JA4S tracker",
+	tl.cfg.logger.Info("wrapped connection with JA4 tracker",
 		zap.String("remote_addr", conn.RemoteAddr().String()),
 		zap.String("conn_type", fmt.Sprintf("%T", conn)),
 	)
@@ -143,26 +143,20 @@ type trackerConfig struct {
 	logger   *zap.Logger
 }
 
-// JA4PlusProvider exposes all computed JA4+ fingerprints for a connection.
-type JA4PlusProvider interface {
-	// JA4S returns the server TLS fingerprint
-	JA4S() (string, error)
-	// JA4 returns the client TLS fingerprint (if available)
+// JA4Provider exposes the computed JA4 (client) fingerprint for a connection.
+type JA4Provider interface {
+	// JA4 returns the client TLS fingerprint
 	JA4() (string, error)
-	// JA4X returns the certificate fingerprint (if available)
-	JA4X() (string, error)
 }
 
 type trackedConn struct {
 	net.Conn
-	serverTracker *serverHelloTracker
 	clientTracker *clientHelloTracker
 }
 
 func newTrackedConn(conn net.Conn, cfg trackerConfig) net.Conn {
 	return &trackedConn{
 		Conn:          conn,
-		serverTracker: newServerHelloTracker(cfg),
 		clientTracker: newClientHelloTracker(cfg),
 	}
 }
@@ -176,41 +170,6 @@ func (tc *trackedConn) Read(p []byte) (int, error) {
 	return n, err
 }
 
-func (tc *trackedConn) Write(p []byte) (int, error) {
-	if tc.serverTracker != nil {
-		// Log first few writes to see if we're capturing data
-		if len(p) > 0 && tc.serverTracker.config.logger != nil {
-			firstBytes := 10
-			if len(p) < firstBytes {
-				firstBytes = len(p)
-			}
-			tc.serverTracker.config.logger.Debug("observed TLS data",
-				zap.Int("bytes", len(p)),
-				zap.String("first_bytes", fmt.Sprintf("%x", p[:firstBytes])),
-			)
-		}
-		tc.serverTracker.Observe(p)
-	}
-	return tc.Conn.Write(p)
-}
-
-func (tc *trackedConn) JA4S() (string, error) {
-	if tc.serverTracker == nil {
-		return "", ErrUnavailable
-	}
-	result, err := tc.serverTracker.Result()
-	if err != nil && tc.serverTracker.config.logger != nil {
-		tc.serverTracker.config.logger.Debug("JA4S() returned error",
-			zap.String("error", err.Error()),
-		)
-	} else if result != "" && tc.serverTracker.config.logger != nil {
-		tc.serverTracker.config.logger.Debug("JA4S() returned fingerprint",
-			zap.String("fingerprint", result),
-		)
-	}
-	return result, err
-}
-
 func (tc *trackedConn) JA4() (string, error) {
 	if tc.clientTracker == nil {
 		return "", ErrUnavailable
@@ -218,175 +177,12 @@ func (tc *trackedConn) JA4() (string, error) {
 	return tc.clientTracker.Result()
 }
 
-func (tc *trackedConn) JA4X() (string, error) {
-	// JA4X requires certificate info, which we'll get from TLS connection state
-	// This will be handled in the handler where we have access to the TLS connection
-	return "", ErrUnavailable
-}
-
-// serverHelloTracker keeps the first TLS record that contains the server hello
-// message and runs it through the go-ja4 parser.
-type serverHelloTracker struct {
-	config trackerConfig
-
-	mu          sync.Mutex
-	buffer      []byte
-	completed   bool
-	fingerprint string
-	err         error
-}
-
 const (
 	minRecordSize = 5
 )
 
-// ErrUnavailable signals that the JA4S fingerprint could not be computed.
-var ErrUnavailable = errors.New("ja4s fingerprint unavailable")
-
-func newServerHelloTracker(cfg trackerConfig) *serverHelloTracker {
-	return &serverHelloTracker{
-		config: cfg,
-		buffer: make([]byte, 0, cfg.maxBytes),
-	}
-}
-
-// Observe records outbound TLS data while waiting for the first ServerHello
-// record to show up.
-func (sht *serverHelloTracker) Observe(p []byte) {
-	sht.mu.Lock()
-	defer sht.mu.Unlock()
-
-	if sht.completed || len(p) == 0 {
-		return
-	}
-
-	remaining := sht.config.maxBytes - len(sht.buffer)
-	if remaining <= 0 {
-		if sht.config.logger != nil {
-			sht.config.logger.Warn("buffer full, cannot capture more data",
-				zap.Int("buffer_len", len(sht.buffer)),
-				zap.Int("max_bytes", sht.config.maxBytes),
-			)
-		}
-		return
-	}
-
-	if len(p) > remaining {
-		sht.buffer = append(sht.buffer, p[:remaining]...)
-		sht.err = fmt.Errorf("server hello exceeded %d bytes", sht.config.maxBytes)
-		sht.completed = true
-		if sht.config.logger != nil {
-			sht.config.logger.Warn("server hello exceeded max bytes",
-				zap.Int("max_bytes", sht.config.maxBytes),
-			)
-		}
-		return
-	}
-
-	sht.buffer = append(sht.buffer, p...)
-	if sht.config.logger != nil {
-		sht.config.logger.Debug("appended data to buffer",
-			zap.Int("bytes", len(p)),
-			zap.Int("total_buffer_len", len(sht.buffer)),
-		)
-	}
-	sht.tryComputeLocked()
-}
-
-func (sht *serverHelloTracker) tryComputeLocked() {
-	data := sht.buffer
-	offset := 0
-
-	for {
-		if len(data[offset:]) < minRecordSize {
-			return
-		}
-
-		contentType := data[offset]
-		recordLength := int(binary.BigEndian.Uint16(data[offset+3 : offset+5]))
-		totalLen := minRecordSize + recordLength
-
-		if len(data[offset:]) < totalLen {
-			return
-		}
-
-		record := data[offset : offset+totalLen]
-
-		if contentType != 0x16 {
-			offset += totalLen
-			continue
-		}
-
-		if len(record) < minRecordSize+1 {
-			sht.err = fmt.Errorf("server hello record truncated")
-			sht.completed = true
-			return
-		}
-
-		handshakeType := record[5]
-		if handshakeType != 0x02 {
-			offset += totalLen
-			continue
-		}
-
-		fp, err := ja4.ParseServerHelloForJA4S(record, sht.config.proto)
-		if err != nil {
-			sht.err = err
-		} else {
-			sht.fingerprint = fp
-		}
-		sht.completed = true
-		return
-	}
-}
-
-// Result returns the JA4S fingerprint (if available).
-func (sht *serverHelloTracker) Result() (string, error) {
-	sht.mu.Lock()
-	defer sht.mu.Unlock()
-
-	if !sht.completed {
-		if sht.config.logger != nil {
-			sht.config.logger.Debug("fingerprint not completed yet, trying to compute",
-				zap.Int("buffer_len", len(sht.buffer)),
-			)
-		}
-		sht.tryComputeLocked()
-	}
-
-	if !sht.completed {
-		if sht.config.logger != nil {
-			sht.config.logger.Debug("fingerprint computation not completed",
-				zap.Int("buffer_len", len(sht.buffer)),
-			)
-		}
-		return "", ErrUnavailable
-	}
-
-	if sht.err != nil {
-		if sht.config.logger != nil {
-			sht.config.logger.Warn("fingerprint computation error",
-				zap.String("error", sht.err.Error()),
-			)
-		}
-		return "", sht.err
-	}
-
-	if sht.fingerprint == "" {
-		if sht.config.logger != nil {
-			sht.config.logger.Warn("fingerprint is empty after computation")
-		}
-		return "", ErrUnavailable
-	}
-
-	if sht.config.logger != nil {
-		sht.config.logger.Info("JA4S fingerprint computed successfully",
-			zap.String("fingerprint", sht.fingerprint),
-		)
-	}
-
-	return sht.fingerprint, nil
-}
+// ErrUnavailable signals that the JA4 fingerprint could not be computed.
+var ErrUnavailable = errors.New("ja4 fingerprint unavailable")
 
 // clientHelloTracker keeps the first TLS record that contains the client hello
 // message and runs it through the go-ja4 parser.
@@ -504,7 +300,7 @@ func (cht *clientHelloTracker) Result() (string, error) {
 	return cht.fingerprint, nil
 }
 
-// parseCaddyfileHandler parses the ja4s handler directive.
+// parseCaddyfileHandler parses the ja4 handler directive.
 func parseCaddyfileHandler(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
 	var handler Handler
 	err := handler.UnmarshalCaddyfile(h.Dispenser)
