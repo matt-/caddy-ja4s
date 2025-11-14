@@ -1,5 +1,6 @@
 module github.com/matt-/caddy-ja4
 
+// Go version 1.25 is required for the go-ja4 module
 go 1.25
 
 require (
