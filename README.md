@@ -110,6 +110,7 @@ ja4 {
     require                         # Reject requests without fingerprint (optional)
     block <fp1> <fp2> ...           # Block specific JA4 fingerprints (optional)
     block_file <path>               # Path to file with blocked fingerprints (optional)
+    watch_block_file                # Watch block file for changes and reload automatically (optional)
 }
 ```
 
@@ -143,7 +144,7 @@ example.com {
 }
 ```
 
-The block file format is one fingerprint per line, with `#` for comments:
+The block file format is one fingerprint per line, with `#` for comments (both full-line and inline comments are supported):
 
 ```
 # Blocked JA4 fingerprints
@@ -151,6 +152,31 @@ t13d1516h2_8daaf6152771_02713d6af862
 t13d190900_9dc949149365_97f8aa674fd9
 # Another blocked fingerprint
 t13d191000_9dc949149365_e7c285222651
+t13d4907h2_0d8feac7bc37_7395dae3b2f3 # curl/8.7.1
 ```
 
 Blocked requests will receive a `403 Forbidden` response. You can combine both `block` and `block_file` options - fingerprints from both sources will be blocked.
+
+### File Watching (Automatic Reload)
+
+When using `block_file`, you can enable automatic file watching to reload the block list without restarting Caddy:
+
+```caddyfile
+example.com {
+    ja4 {
+        var_name ja4
+        block_file /etc/caddy/blocked_ja4s.txt
+        watch_block_file  # Enable automatic file watching
+    }
+    respond "OK"
+}
+```
+
+With `watch_block_file` enabled:
+- The block file is automatically reloaded when it changes
+- No Caddy restart or config reload is needed
+- Changes take effect immediately
+- File watching handles write, create, and rename operations (works with editors that use temp files)
+- Errors during reload are logged but don't affect existing blocking rules
+
+This is especially useful for dynamic blocking scenarios where you need to add or remove fingerprints frequently.

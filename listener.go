@@ -20,7 +20,7 @@ import (
 
 func init() {
 	caddy.RegisterModule(ListenerWrapper{})
-	caddy.RegisterModule(Handler{})
+	caddy.RegisterModule(&Handler{})
 	httpcaddyfile.RegisterHandlerDirective("ja4", parseCaddyfileHandler)
 }
 
@@ -352,8 +352,3 @@ var (
 	_ caddy.Provisioner     = (*ListenerWrapper)(nil)
 	_ caddy.Validator       = (*ListenerWrapper)(nil)
 )
-
-
-
-
-

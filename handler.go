@@ -4,11 +4,14 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	"github.com/fsnotify/fsnotify"
 	"go.uber.org/zap"
 )
 
@@ -34,12 +37,18 @@ type Handler struct {
 	// Path to a file containing JA4 fingerprints to block (one per line).
 	BlockFile string `json:"block_file,omitempty"`
 
+	// If true, watch the block file for changes and reload automatically.
+	WatchBlockFile bool `json:"watch_block_file,omitempty"`
+
 	logger     *zap.Logger
 	blockedSet map[string]bool // For efficient lookup
+	blockedMu  sync.RWMutex    // Protects blockedSet for thread-safe access
+	watcher    *fsnotify.Watcher
+	watcherMu  sync.Mutex // Protects watcher
 }
 
 // CaddyModule implements caddy.Module.
-func (Handler) CaddyModule() caddy.ModuleInfo {
+func (*Handler) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
 		ID:  "http.handlers.ja4",
 		New: func() caddy.Module { return new(Handler) },
@@ -65,31 +74,189 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 
 	// Load fingerprints from file if specified
 	if h.BlockFile != "" {
-		data, err := os.ReadFile(h.BlockFile)
-		if err != nil {
-			return fmt.Errorf("failed to read block file %s: %w", h.BlockFile, err)
+		if err := h.loadBlockFile(); err != nil {
+			return err
 		}
 
-		lines := strings.Split(strings.TrimSpace(string(data)), "\n")
-		for _, line := range lines {
-			line = strings.TrimSpace(line)
-			// Skip empty lines and comments
-			if line == "" || strings.HasPrefix(line, "#") {
-				continue
+		// Start file watcher if enabled
+		if h.WatchBlockFile {
+			if err := h.startFileWatcher(); err != nil {
+				return fmt.Errorf("failed to start file watcher: %w", err)
 			}
-			h.blockedSet[line] = true
 		}
+	}
 
-		h.logger.Info("loaded blocked JA4 fingerprints from file",
-			zap.String("file", h.BlockFile),
-			zap.Int("count", len(h.blockedSet)),
+	h.blockedMu.RLock()
+	count := len(h.blockedSet)
+	h.blockedMu.RUnlock()
+
+	if count > 0 {
+		h.logger.Info("JA4 blocking enabled",
+			zap.Int("blocked_count", count),
+			zap.Bool("watching_file", h.WatchBlockFile && h.BlockFile != ""),
 		)
 	}
 
-	if len(h.blockedSet) > 0 {
-		h.logger.Info("JA4 blocking enabled",
-			zap.Int("blocked_count", len(h.blockedSet)),
-		)
+	return nil
+}
+
+// loadBlockFile loads fingerprints from the block file into blockedSet.
+// This is thread-safe and can be called from the file watcher.
+func (h *Handler) loadBlockFile() error {
+	data, err := os.ReadFile(h.BlockFile)
+	if err != nil {
+		return fmt.Errorf("failed to read block file %s: %w", h.BlockFile, err)
+	}
+
+	newSet := make(map[string]bool)
+
+	// First, add fingerprints from the inline list (these are always included)
+	for _, fp := range h.BlockedJA4s {
+		if fp != "" {
+			newSet[fp] = true
+		}
+	}
+
+	// Then, add fingerprints from the file
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		// Skip empty lines
+		if line == "" {
+			continue
+		}
+		// Strip inline comments (everything after #)
+		if idx := strings.Index(line, "#"); idx >= 0 {
+			line = strings.TrimSpace(line[:idx])
+			// Skip if line is now empty after stripping comment
+			if line == "" {
+				continue
+			}
+		}
+		// Skip lines that start with # (full-line comments)
+		if strings.HasPrefix(line, "#") {
+			continue
+		}
+		newSet[line] = true
+	}
+
+	// Atomically replace the blocked set
+	h.blockedMu.Lock()
+	h.blockedSet = newSet
+	count := len(h.blockedSet)
+	h.blockedMu.Unlock()
+
+	h.logger.Info("loaded blocked JA4 fingerprints from file",
+		zap.String("file", h.BlockFile),
+		zap.Int("count", count),
+	)
+
+	return nil
+}
+
+// startFileWatcher starts watching the block file for changes.
+func (h *Handler) startFileWatcher() error {
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		return fmt.Errorf("failed to create file watcher: %w", err)
+	}
+
+	// Watch the directory containing the file, not the file itself
+	// (some editors write to a temp file and rename, which doesn't trigger
+	// file-level watches but does trigger directory-level watches)
+	dir := filepath.Dir(h.BlockFile)
+	if err := watcher.Add(dir); err != nil {
+		watcher.Close()
+		return fmt.Errorf("failed to watch directory %s: %w", dir, err)
+	}
+
+	h.watcherMu.Lock()
+	h.watcher = watcher
+	h.watcherMu.Unlock()
+
+	// Start goroutine to handle file events
+	go h.watchFile()
+
+	h.logger.Info("started watching block file for changes",
+		zap.String("file", h.BlockFile),
+		zap.String("directory", dir),
+	)
+
+	return nil
+}
+
+// watchFile handles file system events and reloads the block file when it changes.
+func (h *Handler) watchFile() {
+	defer func() {
+		h.watcherMu.Lock()
+		if h.watcher != nil {
+			h.watcher.Close()
+		}
+		h.watcherMu.Unlock()
+	}()
+
+	for {
+		h.watcherMu.Lock()
+		watcher := h.watcher
+		h.watcherMu.Unlock()
+
+		if watcher == nil {
+			return
+		}
+
+		select {
+		case event, ok := <-watcher.Events:
+			if !ok {
+				return
+			}
+			// Check if the event is for our block file
+			if event.Name == h.BlockFile {
+				// Handle write, create, and rename events
+				if event.Op&fsnotify.Write == fsnotify.Write ||
+					event.Op&fsnotify.Create == fsnotify.Create ||
+					event.Op&fsnotify.Rename == fsnotify.Rename {
+					h.logger.Debug("block file changed, reloading",
+						zap.String("file", h.BlockFile),
+						zap.String("op", event.Op.String()),
+					)
+					if err := h.loadBlockFile(); err != nil {
+						h.logger.Error("failed to reload block file",
+							zap.String("file", h.BlockFile),
+							zap.Error(err),
+						)
+					} else {
+						h.logger.Info("block file reloaded successfully",
+							zap.String("file", h.BlockFile),
+						)
+					}
+				}
+			}
+
+		case err, ok := <-watcher.Errors:
+			if !ok {
+				return
+			}
+			h.logger.Error("file watcher error",
+				zap.String("file", h.BlockFile),
+				zap.Error(err),
+			)
+		}
+	}
+}
+
+// Cleanup stops the file watcher when the handler is being cleaned up.
+func (h *Handler) Cleanup() error {
+	h.watcherMu.Lock()
+	defer h.watcherMu.Unlock()
+
+	if h.watcher != nil {
+		if err := h.watcher.Close(); err != nil {
+			h.logger.Warn("error closing file watcher",
+				zap.String("file", h.BlockFile),
+				zap.Error(err),
+			)
+		}
+		h.watcher = nil
 	}
 
 	return nil
@@ -136,6 +303,9 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			}
 			h.BlockFile = d.Val()
 
+		case "watch_block_file":
+			h.WatchBlockFile = true
+
 		default:
 			return d.Errf("unknown option: %s", d.Val())
 		}
@@ -176,8 +346,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		return next.ServeHTTP(w, r)
 	}
 
-	// Check if fingerprint is blocked
-	if h.blockedSet[fingerprint] {
+	// Check if fingerprint is blocked (thread-safe read)
+	h.blockedMu.RLock()
+	isBlocked := h.blockedSet[fingerprint]
+	h.blockedMu.RUnlock()
+
+	if isBlocked {
 		h.logger.Warn("request blocked due to JA4 fingerprint",
 			zap.String("fingerprint", fingerprint),
 			zap.String("remote_addr", r.RemoteAddr),
@@ -231,4 +405,5 @@ var (
 	_ caddyfile.Unmarshaler       = (*Handler)(nil)
 	_ caddyhttp.MiddlewareHandler = (*Handler)(nil)
 	_ caddy.Provisioner           = (*Handler)(nil)
+	_ caddy.CleanerUpper          = (*Handler)(nil)
 )
