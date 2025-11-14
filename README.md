@@ -1,43 +1,33 @@
-## Caddy JA4 Module
+## Caddy JA4 Module (WIP)
 
-This repository provides a pair of modules that make the client-side
-[JA4](https://github.com/FoxIO-LLC/ja4) fingerprint available inside the Caddy
-HTTP pipeline by reusing the TLS parsing logic from
+This repository provides the [JA4](https://github.com/FoxIO-LLC/ja4) fingerprint available inside the Caddy
+HTTP pipeline by using logic from
 [`github.com/voukatas/go-ja4`](https://github.com/voukatas/go-ja4).
-
-- `caddy.listeners.ja4` – a listener wrapper that records the TLS
-  `ClientHello` record before it is encrypted so it can be turned into a JA4
-  fingerprint.
-- `http.handlers.ja4` – an HTTP handler that injects the computed fingerprint
-  into request metadata (headers/vars) so the rest of the Caddy config can use
-  it (for logging, routing, forwarding to an upstream, etc.).
 
 ### About JA4 Fingerprints
 
 JA4 fingerprints the **client's** TLS handshake (ClientHello), producing a
-fingerprint like `t13d1516h2_8daaf6152771_02713d6af862`. This fingerprint is
+fingerprint like `t13d1517h2_8daaf6152771_b6f405a00624`. This fingerprint is
 consistent for a given client configuration and can be used to identify clients
 and TLS libraries. The fingerprint format matches the
 [JA4 standard](https://github.com/FoxIO-LLC/ja4) and can be looked up in
 fingerprint databases like the
-[JA4+ mapping CSV](https://raw.githubusercontent.com/FoxIO-LLC/ja4/main/ja4plus-mapping.csv).
+[JA4 DB](https://docs.ja4db.com/ja4+-database/usage/read-the-database).
 
 ### Installation
 
 Build Caddy with this module enabled, for example with `xcaddy`:
 
 ```bash
-# From the caddy-ja4s directory
-xcaddy build --with github.com/matt-/caddy-ja4s=.
 
-# Or with an absolute path
-xcaddy build --with github.com/matt-/caddy-ja4s=/Users/mattaustin/hax/caddy/caddy-ja4s
+xcaddy build --with github.com/matt-/caddy-ja4s
+
 ```
 
 **If building Caddy from source**, add this to Caddy's `go.mod`:
 
 ```go
-replace github.com/matt-/caddy-ja4s => /Users/mattaustin/hax/caddy/caddy-ja4s
+replace github.com/matt-/caddy-ja4s => /path/to/project/caddy-ja4s
 ```
 
 ### Configuration
@@ -118,7 +108,49 @@ ja4 {
     response_header <header-name>   # Header to set on response (optional)
     var_name <name>                 # Variable name (default: "ja4")
     require                         # Reject requests without fingerprint (optional)
+    block <fp1> <fp2> ...           # Block specific JA4 fingerprints (optional)
+    block_file <path>               # Path to file with blocked fingerprints (optional)
 }
 ```
 
 The JA4 fingerprint is available as the `{http.vars.ja4}` placeholder (or whatever you set with `var_name`).
+
+### Blocking JA4 Fingerprints
+
+You can block requests based on their JA4 fingerprint using the `block` option or `block_file` option:
+
+**Using inline block list:**
+
+```caddyfile
+example.com {
+    ja4 {
+        var_name ja4
+        block t13d1516h2_8daaf6152771_02713d6af862 t13d190900_9dc949149365_97f8aa674fd9
+    }
+    respond "OK"
+}
+```
+
+**Using a block file:**
+
+```caddyfile
+example.com {
+    ja4 {
+        var_name ja4
+        block_file /etc/caddy/blocked_ja4s.txt
+    }
+    respond "OK"
+}
+```
+
+The block file format is one fingerprint per line, with `#` for comments:
+
+```
+# Blocked JA4 fingerprints
+t13d1516h2_8daaf6152771_02713d6af862
+t13d190900_9dc949149365_97f8aa674fd9
+# Another blocked fingerprint
+t13d191000_9dc949149365_e7c285222651
+```
+
+Blocked requests will receive a `403 Forbidden` response. You can combine both `block` and `block_file` options - fingerprints from both sources will be blocked.

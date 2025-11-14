@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
+	"strings"
 	"unsafe"
 
 	"github.com/caddyserver/caddy/v2"
@@ -30,7 +32,14 @@ type Handler struct {
 	// If true, requests will fail when a fingerprint cannot be produced.
 	Require bool `json:"require,omitempty"`
 
-	logger *zap.Logger
+	// List of JA4 fingerprints to block. Requests with matching fingerprints will be rejected.
+	BlockedJA4s []string `json:"blocked_ja4s,omitempty"`
+
+	// Path to a file containing JA4 fingerprints to block (one per line).
+	BlockFile string `json:"block_file,omitempty"`
+
+	logger     *zap.Logger
+	blockedSet map[string]bool // For efficient lookup
 }
 
 // CaddyModule implements caddy.Module.
@@ -47,6 +56,46 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	if h.VarName == "" {
 		h.VarName = "ja4"
 	}
+
+	// Build blocked set from both list and file
+	h.blockedSet = make(map[string]bool)
+
+	// Add fingerprints from the list
+	for _, fp := range h.BlockedJA4s {
+		if fp != "" {
+			h.blockedSet[fp] = true
+		}
+	}
+
+	// Load fingerprints from file if specified
+	if h.BlockFile != "" {
+		data, err := os.ReadFile(h.BlockFile)
+		if err != nil {
+			return fmt.Errorf("failed to read block file %s: %w", h.BlockFile, err)
+		}
+
+		lines := strings.Split(string(data), "\n")
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			// Skip empty lines and comments
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			h.blockedSet[line] = true
+		}
+
+		h.logger.Info("loaded blocked JA4 fingerprints from file",
+			zap.String("file", h.BlockFile),
+			zap.Int("count", len(h.blockedSet)),
+		)
+	}
+
+	if len(h.blockedSet) > 0 {
+		h.logger.Info("JA4 blocking enabled",
+			zap.Int("blocked_count", len(h.blockedSet)),
+		)
+	}
+
 	return nil
 }
 
@@ -78,6 +127,18 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 
 		case "require":
 			h.Require = true
+
+		case "block":
+			// Parse multiple JA4 fingerprints to block
+			for d.NextArg() {
+				h.BlockedJA4s = append(h.BlockedJA4s, d.Val())
+			}
+
+		case "block_file":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			h.BlockFile = d.Val()
 
 		default:
 			return d.Errf("unknown option: %s", d.Val())
@@ -117,6 +178,16 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhtt
 			return caddyhttp.Error(http.StatusPreconditionFailed, fmt.Errorf("ja4 fingerprint missing: %w", err))
 		}
 		return next.ServeHTTP(w, r)
+	}
+
+	// Check if fingerprint is blocked
+	if h.blockedSet != nil && h.blockedSet[fingerprint] {
+		h.logger.Warn("request blocked due to JA4 fingerprint",
+			zap.String("fingerprint", fingerprint),
+			zap.String("remote_addr", r.RemoteAddr),
+			zap.String("host", r.Host),
+		)
+		return caddyhttp.Error(http.StatusForbidden, fmt.Errorf("request blocked: JA4 fingerprint %s is not allowed", fingerprint))
 	}
 
 	h.logger.Info("JA4 fingerprint extracted successfully",
