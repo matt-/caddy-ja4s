@@ -20,7 +20,7 @@ Build Caddy with this module enabled, for example with `xcaddy`:
 
 ```bash
 
-xcaddy build --with github.com/matt-/caddy-ja4s
+xcaddy build --with github.com/matt-/caddy-ja4
 
 ```
 

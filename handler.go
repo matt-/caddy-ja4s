@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"reflect"
 	"strings"
 	"unsafe"
 
@@ -74,7 +75,7 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 			return fmt.Errorf("failed to read block file %s: %w", h.BlockFile, err)
 		}
 
-		lines := strings.Split(string(data), "\n")
+		lines := strings.Split(strings.TrimSpace(string(data)), "\n")
 		for _, line := range lines {
 			line = strings.TrimSpace(line)
 			// Skip empty lines and comments
@@ -149,7 +150,7 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 }
 
 // ServeHTTP makes the JA4 fingerprint available downstream.
-func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
+func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	defer func() {
 		if rec := recover(); rec != nil {
 			h.logger.Error("panic in JA4 handler",
@@ -181,7 +182,7 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhtt
 	}
 
 	// Check if fingerprint is blocked
-	if h.blockedSet != nil && h.blockedSet[fingerprint] {
+	if h.blockedSet[fingerprint] {
 		h.logger.Warn("request blocked due to JA4 fingerprint",
 			zap.String("fingerprint", fingerprint),
 			zap.String("remote_addr", r.RemoteAddr),
@@ -190,7 +191,7 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhtt
 		return caddyhttp.Error(http.StatusForbidden, fmt.Errorf("request blocked: JA4 fingerprint %s is not allowed", fingerprint))
 	}
 
-	h.logger.Info("JA4 fingerprint extracted successfully",
+	h.logger.Debug("JA4 fingerprint extracted successfully",
 		zap.String("fingerprint", fingerprint),
 		zap.String("remote_addr", r.RemoteAddr),
 		zap.String("host", r.Host),
@@ -228,47 +229,16 @@ func JA4FromRequest(r *http.Request, logger *zap.Logger) (string, error) {
 	if !ok {
 		// If it's a TLS connection, try to unwrap it to get the underlying connection
 		if tlsConn, isTLS := conn.(*tls.Conn); isTLS {
-			logger.Debug("connection is TLS, attempting to unwrap",
-				zap.String("tls_conn_type", fmt.Sprintf("%T", tlsConn)),
-			)
-			// Use unsafe to access the unexported "conn" field in tls.Conn
-			func() {
-				defer func() {
-					if rec := recover(); rec != nil {
-						logger.Warn("panic while accessing TLS connection field",
-							zap.Any("panic", rec),
-						)
-					}
-				}()
-
-				// Create a struct with the same layout as tls.Conn's first field
-				type tlsConnStruct struct {
-					conn net.Conn
-				}
-
-				// Cast tls.Conn to our struct type to access the first field
-				tlsConnAsStruct := (*tlsConnStruct)(unsafe.Pointer(tlsConn))
-				if tlsConnAsStruct != nil && tlsConnAsStruct.conn != nil {
-					underlyingConn := tlsConnAsStruct.conn
-					logger.Debug("found underlying connection",
-						zap.String("underlying_conn_type", fmt.Sprintf("%T", underlyingConn)),
-					)
-					if foundProvider, foundOK := underlyingConn.(JA4Provider); foundOK {
-						logger.Debug("underlying connection implements JA4Provider")
-						provider = foundProvider
-						ok = true
-					} else {
-						logger.Warn("underlying connection does not implement JA4Provider",
-							zap.String("underlying_conn_type", fmt.Sprintf("%T", underlyingConn)),
-						)
-					}
-				} else {
-					logger.Warn("could not access underlying connection from TLS connection")
-				}
-			}()
-		}
-
-		if !ok {
+			var err error
+			provider, err = unwrapTLSConnection(tlsConn, logger)
+			if err != nil {
+				logger.Warn("connection does not implement JA4Provider",
+					zap.String("conn_type", fmt.Sprintf("%T", conn)),
+					zap.Error(err),
+				)
+				return "", ErrUnavailable
+			}
+		} else {
 			logger.Warn("connection does not implement JA4Provider",
 				zap.String("conn_type", fmt.Sprintf("%T", conn)),
 			)
@@ -278,6 +248,57 @@ func JA4FromRequest(r *http.Request, logger *zap.Logger) (string, error) {
 
 	logger.Debug("connection implements JA4Provider, calling JA4()")
 	return provider.JA4()
+}
+
+// unwrapTLSConnection extracts the underlying connection from a tls.Conn using reflection.
+// This is necessary because tls.Conn's underlying connection field is unexported.
+// While this uses unsafe internally via reflect.NewAt, it provides a more structured
+// and type-safe API than direct unsafe.Pointer manipulation.
+func unwrapTLSConnection(tlsConn *tls.Conn, logger *zap.Logger) (JA4Provider, error) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			logger.Warn("panic while accessing TLS connection field",
+				zap.Any("panic", rec),
+			)
+		}
+	}()
+
+	logger.Debug("connection is TLS, attempting to unwrap",
+		zap.String("tls_conn_type", fmt.Sprintf("%T", tlsConn)),
+	)
+
+	// Use reflection to access the unexported "conn" field
+	connValue := reflect.ValueOf(tlsConn).Elem()
+	connField := connValue.FieldByName("conn")
+
+	if !connField.IsValid() {
+		return nil, fmt.Errorf("could not find 'conn' field in tls.Conn")
+	}
+
+	// For unexported fields, we need to use reflect.NewAt to create a value
+	// that can be interfaced. This requires converting the field's address
+	// to unsafe.Pointer, but uses reflection's structured API rather than
+	// direct unsafe pointer manipulation, making it safer and more maintainable.
+	if !connField.CanInterface() {
+		connField = reflect.NewAt(connField.Type(), unsafe.Pointer(connField.UnsafeAddr())).Elem()
+	}
+
+	underlyingConn, ok := connField.Interface().(net.Conn)
+	if !ok || underlyingConn == nil {
+		return nil, fmt.Errorf("underlying connection field is not a valid net.Conn")
+	}
+
+	logger.Debug("found underlying connection",
+		zap.String("underlying_conn_type", fmt.Sprintf("%T", underlyingConn)),
+	)
+
+	provider, ok := underlyingConn.(JA4Provider)
+	if !ok {
+		return nil, fmt.Errorf("underlying connection does not implement JA4Provider (type: %T)", underlyingConn)
+	}
+
+	logger.Debug("underlying connection implements JA4Provider")
+	return provider, nil
 }
 
 func connectionFromRequest(r *http.Request, logger *zap.Logger) (net.Conn, error) {
