@@ -1,4 +1,4 @@
-package ja4s
+package ja4
 
 import (
 	"encoding/binary"
