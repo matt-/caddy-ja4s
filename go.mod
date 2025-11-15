@@ -6,7 +6,6 @@ go 1.25
 require (
 	github.com/caddyserver/caddy/v2 v2.10.2
 	github.com/fsnotify/fsnotify v1.9.0
-	github.com/voukatas/go-ja4 v0.0.0-20241129110151-36c77b774239
 	go.uber.org/zap v1.27.0
 )
 
