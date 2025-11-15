@@ -1,6 +1,8 @@
 package ja4
 
 import (
+	"bufio"
+	"encoding/binary"
 	"net"
 	"strings"
 	"sync"
@@ -32,54 +34,20 @@ func (tl *trackingListener) Accept() (net.Conn, error) {
 		return nil, err
 	}
 
-	// Read ClientHello upfront before TLS wraps the connection
-	// For HTTP connections (port 80), this will fail, which is expected
-	// We need to use a peek/rewind approach to avoid consuming bytes from HTTP connections
-	clientHello, peekedBytes, err := readClientHelloWithPeek(conn, tl.cfg.maxBytes)
-	if err != nil {
-		// This is expected for HTTP connections (no TLS handshake)
-		// Only log at debug level to avoid noise
-		tl.cfg.logger.Debug("no ClientHello found (likely HTTP connection)",
-			zap.String("remote_addr", conn.RemoteAddr().String()),
-			zap.Error(err),
-		)
-		// We must rewind the bytes we peeked, otherwise HTTP requests will be broken
-		// Create a rewind connection with the peeked bytes so they can be replayed
-		return newRewindConn(conn, peekedBytes), nil
+	// Wrap the connection to intercept the first Read() call and peek at ClientHello
+	// This approach uses bufio.Reader.Peek() which doesn't consume bytes, so no rewinding needed
+	wrapped := &ja4ConnWrapper{
+		Conn:      conn,
+		cfg:       tl.cfg,
+		done:      false,
+		bufReader: bufio.NewReader(conn),
 	}
-
-	// Compute JA4 fingerprint using our own implementation
-	fingerprint, err := computeJA4(clientHello, tl.cfg.proto, tl.cfg.logger)
-	if err != nil {
-		tl.cfg.logger.Debug("failed to compute JA4 fingerprint",
-			zap.String("remote_addr", conn.RemoteAddr().String()),
-			zap.Error(err),
-		)
-		// Return connection with rewind capability so TLS can still read the ClientHello
-		return newRewindConn(conn, clientHello), nil
-	}
-
-	tl.cfg.logger.Debug("computed JA4 fingerprint from ClientHello",
-		zap.String("remote_addr", conn.RemoteAddr().String()),
-		zap.String("fingerprint", fingerprint),
-	)
-
-	// Store fingerprint in cache keyed by connection address
-	// Normalize the address to handle IPv6 brackets and ensure consistent format
-	addr := normalizeAddr(conn.RemoteAddr().String())
-	tl.cfg.cache.Set(addr, fingerprint)
-
-	tl.cfg.logger.Debug("stored JA4 fingerprint in cache",
-		zap.String("addr", addr),
-		zap.String("fingerprint", fingerprint),
-	)
 
 	// Create a tracked connection that will clean up the cache on close
 	tracked := &trackedConn{
-		Conn:        newRewindConn(conn, clientHello),
-		addr:        addr,
-		cache:       tl.cfg.cache,
-		fingerprint: fingerprint,
+		Conn:  wrapped,
+		addr:  normalizeAddr(conn.RemoteAddr().String()),
+		cache: tl.cfg.cache,
 	}
 
 	return tracked, nil
@@ -87,10 +55,9 @@ func (tl *trackingListener) Accept() (net.Conn, error) {
 
 type trackedConn struct {
 	net.Conn
-	addr        string
-	cache       *fingerprintCache
-	fingerprint string
-	mu          sync.RWMutex
+	addr  string
+	cache *fingerprintCache
+	mu    sync.RWMutex
 }
 
 func (tc *trackedConn) Close() error {
@@ -102,43 +69,103 @@ func (tc *trackedConn) Close() error {
 }
 
 func (tc *trackedConn) JA4() (string, error) {
-	tc.mu.RLock()
-	defer tc.mu.RUnlock()
-	if tc.fingerprint == "" {
+	// Look up fingerprint from cache by address
+	if tc.cache == nil || tc.addr == "" {
 		return "", ErrUnavailable
 	}
-	return tc.fingerprint, nil
+	fp, ok := tc.cache.Get(tc.addr)
+	if !ok {
+		return "", ErrUnavailable
+	}
+	return fp, nil
 }
 
-// rewindConn creates a connection that allows the ClientHello data to be read again.
-// This is necessary because we read the ClientHello upfront, but TLS needs to read it too.
-type rewindConn struct {
+// ja4ConnWrapper wraps a connection and intercepts the first Read() call to peek at ClientHello.
+// This uses bufio.Reader.Peek() which doesn't consume bytes, so TLS can read normally afterward.
+type ja4ConnWrapper struct {
 	net.Conn
-	buf    []byte
-	offset int
-	mu     sync.Mutex
+	cfg       trackerConfig
+	done      bool
+	bufReader *bufio.Reader
+	mu        sync.Mutex
 }
 
-func newRewindConn(conn net.Conn, data []byte) net.Conn {
-	return &rewindConn{
-		Conn: conn,
-		buf:  data,
+func (w *ja4ConnWrapper) Read(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	// On first Read(), peek at ClientHello to compute JA4 fingerprint
+	if !w.done {
+		w.done = true
+		w.captureClientHello()
 	}
+
+	// Now read normally - bufio.Reader handles buffering automatically
+	return w.bufReader.Read(p)
 }
 
-func (rc *rewindConn) Read(p []byte) (int, error) {
-	rc.mu.Lock()
-	defer rc.mu.Unlock()
-
-	// First, serve the buffered data
-	if rc.offset < len(rc.buf) {
-		n := copy(p, rc.buf[rc.offset:])
-		rc.offset += n
-		return n, nil
+// captureClientHello peeks at the ClientHello message without consuming bytes.
+func (w *ja4ConnWrapper) captureClientHello() {
+	// Peek at the TLS record header (5 bytes)
+	header, err := w.bufReader.Peek(5)
+	if err != nil {
+		// Not enough data or not TLS - this is fine for HTTP connections
+		w.cfg.logger.Debug("could not peek TLS header (likely HTTP connection)",
+			zap.String("remote_addr", w.Conn.RemoteAddr().String()),
+			zap.Error(err),
+		)
+		return
 	}
 
-	// Once buffered data is exhausted, read from the underlying connection
-	return rc.Conn.Read(p)
+	// Check if it's a TLS handshake record
+	if header[0] != tlsRecordTypeHandshake {
+		// Not TLS - this is fine, just return
+		return
+	}
+
+	// Get the record length
+	recordLength := int(binary.BigEndian.Uint16(header[3:5]))
+	if recordLength > w.cfg.maxBytes {
+		w.cfg.logger.Debug("ClientHello record too large",
+			zap.String("remote_addr", w.Conn.RemoteAddr().String()),
+			zap.Int("record_length", recordLength),
+			zap.Int("max_bytes", w.cfg.maxBytes),
+		)
+		return
+	}
+
+	// Peek at the full ClientHello record (header + body)
+	peekedData, err := w.bufReader.Peek(5 + recordLength)
+	if err != nil {
+		w.cfg.logger.Debug("could not peek full ClientHello record",
+			zap.String("remote_addr", w.Conn.RemoteAddr().String()),
+			zap.Error(err),
+		)
+		return
+	}
+
+	// Copy the peeked data since Peek() returns a slice that's only valid until the next read
+	clientHello := make([]byte, len(peekedData))
+	copy(clientHello, peekedData)
+
+	// Compute JA4 fingerprint
+	fingerprint, err := computeJA4(clientHello, w.cfg.proto, w.cfg.logger)
+	if err != nil {
+		w.cfg.logger.Debug("failed to compute JA4 fingerprint",
+			zap.String("remote_addr", w.Conn.RemoteAddr().String()),
+			zap.Error(err),
+		)
+		return
+	}
+
+	// Store fingerprint in cache keyed by connection address
+	addr := normalizeAddr(w.Conn.RemoteAddr().String())
+	w.cfg.cache.Set(addr, fingerprint)
+
+	w.cfg.logger.Debug("computed and stored JA4 fingerprint",
+		zap.String("remote_addr", addr),
+		zap.String("fingerprint", fingerprint),
+	)
 }
 
 // normalizeAddr normalizes a network address to ensure consistent format
