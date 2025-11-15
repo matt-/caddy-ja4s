@@ -110,16 +110,22 @@ func (lw *ListenerWrapper) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 
 // WrapListener wraps the provided listener with the JA4 capturing logic.
 func (lw *ListenerWrapper) WrapListener(ln net.Listener) net.Listener {
-	cache := newFingerprintCache()
-	// Set global cache so handler can access it
-	globalCache = cache
+	// Use a singleton cache that persists across reconfigurations
+	// This ensures fingerprints aren't lost when Caddy reconfigures
+	if globalCache == nil {
+		globalCache = newFingerprintCache()
+		lw.logger.Debug("created new global JA4 fingerprint cache")
+	} else {
+		lw.logger.Debug("reusing existing global JA4 fingerprint cache")
+	}
+
 	return &trackingListener{
 		Listener: ln,
 		cfg: trackerConfig{
 			maxBytes: lw.MaxCaptureBytes,
 			proto:    lw.protocolByte,
 			logger:   lw.logger,
-			cache:    cache,
+			cache:    globalCache,
 		},
 	}
 }
